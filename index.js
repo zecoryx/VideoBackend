@@ -1,218 +1,151 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const cors = require("cors");
+const express = require("express")
+const http = require("http")
+const { Server } = require("socket.io")
+const cors = require("cors")
 
-const app = express();
-app.use(cors());
+const app = express()
+const server = http.createServer(app)
 
-const server = http.createServer(app);
+// Enable CORS
+app.use(cors())
+
+// Create Socket.io server with CORS configuration
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: "*", // In production, restrict this to your frontend URL
     methods: ["GET", "POST"],
   },
-});
+})
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000
 
-// Store for waiting users
-const waitingUsers = {
-  global: [],
-};
+// Variables to track users and rooms
+let waitingUser = null // waiting user
+const rooms = {} // roomId -> [socketId, socketId]
 
-// Store for active rooms
-const activeRooms = new Map();
+// Serve a simple status page
+app.get("/", (req, res) => {
+  res.send("Video Chat Server is running")
+})
 
-// Helper function to find a match for a user
-function findMatch(userId, country) {
-  // Initialize country-specific waiting room if it doesn't exist
-  if (!waitingUsers[country]) {
-    waitingUsers[country] = [];
-  }
-
-  // First try to match with someone from the same country
-  if (waitingUsers[country].length > 0) {
-    const matchedUser = waitingUsers[country].shift();
-    return matchedUser;
-  }
-
-  // If no match in the same country, try the global pool
-  if (waitingUsers.global.length > 0) {
-    const matchedUser = waitingUsers.global.shift();
-    return matchedUser;
-  }
-
-  // No match found
-  return null;
-}
-
+// Socket.io connection handling
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log(`User connected: ${socket.id}`)
 
-  // Join waiting room
-  socket.on("join_waiting_room", ({ userId, country = "global" }) => {
-    console.log(`User ${userId} (${socket.id}) joined waiting room for ${country}`);
+  // Send waiting message
+  socket.emit("waiting", "Looking for a partner...")
 
-    // Try to find a match
-    const match = findMatch(userId, country);
+  // Matchmaking: random 1-to-1 pairing
+  if (waitingUser === null) {
+    waitingUser = socket
+  } else if (waitingUser.id !== socket.id) {
+    // Create a new room
+    const roomId = `${socket.id}#${waitingUser.id}`
+    rooms[roomId] = [waitingUser.id, socket.id]
 
-    if (match) {
-      // Create a new room for the matched users
-      const roomId = `room_${Math.random().toString(36).substr(2, 9)}`;
+    // Add both users to the room
+    waitingUser.join(roomId)
+    socket.join(roomId)
 
-      // Add both users to the room
-      socket.join(roomId);
-      io.sockets.sockets.get(match.socketId)?.join(roomId);
+    // Notify both users about the room
+    io.to(roomId).emit("room-joined", roomId)
 
-      // Store room information
-      activeRooms.set(roomId, {
-        users: [
-          { userId, socketId: socket.id },
-          { userId: match.userId, socketId: match.socketId },
-        ],
-        createdAt: Date.now(),
-      });
+    // Reset waiting user
+    waitingUser = null
+  }
 
-      // Notify both users about the match
-      io.to(match.socketId).emit("matched", {
-        roomId,
-        peerId: socket.id,
-      });
-
-      socket.emit("matched", {
-        roomId,
-        peerId: match.socketId,
-      });
-
-      console.log(`Matched users in room ${roomId}: ${userId} and ${match.userId}`);
-    } else {
-      // Add user to waiting room
-      const waitingUser = {
-        userId,
-        socketId: socket.id,
-        country,
-        joinedAt: Date.now(),
-      };
-
-      // Add to country-specific room and global room for better matching chances
-      if (country !== "global") {
-        if (!waitingUsers[country]) {
-          waitingUsers[country] = [];
-        }
-        waitingUsers[country].push(waitingUser);
-      }
-      waitingUsers.global.push(waitingUser);
-
-      console.log(`User ${userId} added to waiting room for ${country}`);
-    }
-  });
-
-  socket.on("offer", ({ roomId, offer, peerId }) => {
-    console.log(`Received offer in room ${roomId}`);
-    io.to(peerId).emit("offer", {
-      offer,
-      sender: socket.id,
-    });
-  });
-
-  socket.on("answer", ({ roomId, answer, peerId }) => {
-    console.log(`Received answer in room ${roomId}`);
-    io.to(peerId).emit("answer", {
-      answer,
-      sender: socket.id,
-    });
-  });
-
-  socket.on("ice-candidate", ({ roomId, candidate, peerId }) => {
-    io.to(peerId).emit("ice-candidate", {
-      candidate,
-      sender: socket.id,
-    });
-  });
+  // Handle signaling for WebRTC
+  socket.on("signal", (data) => {
+    // data: { roomId, to, signalData }
+    io.to(data.to).emit("signal", {
+      from: socket.id,
+      signalData: data.signalData,
+    })
+  })
 
   // Handle chat messages
-  socket.on("chat_message", ({ roomId, message, peerId }) => {
-    socket.to(roomId).emit("chat_message", {
-      message,
-      sender: socket.id,
-    });
-  });
+  socket.on("chat-message", (data) => {
+    // data: { roomId, message }
+    io.to(data.roomId).emit("chat-message", {
+      from: socket.id,
+      message: data.message,
+    })
+  })
 
-  // Handle leaving a room
-  socket.on("leave_room", ({ roomId }) => {
-    if (roomId && activeRooms.has(roomId)) {
-      const room = activeRooms.get(roomId);
+  // Handle finding a new partner
+  socket.on("find-partner", () => {
+    // Remove from current room if any
+    for (const roomId in rooms) {
+      if (rooms[roomId].includes(socket.id)) {
+        // Notify the other user
+        socket.to(roomId).emit("user-disconnected")
 
-      // Notify the other user in the room
-      room.users.forEach((user) => {
-        if (user.socketId !== socket.id) {
-          io.to(user.socketId).emit("peer_disconnected");
-        }
-      });
+        // Clean up the room
+        delete rooms[roomId]
 
-      // Remove the room if both users have left
-      socket.leave(roomId);
-      const remainingUsers = io.sockets.adapter.rooms.get(roomId);
-      if (!remainingUsers || remainingUsers.size === 0) {
-        activeRooms.delete(roomId);
-        console.log(`Room ${roomId} deleted`);
+        // Leave the room
+        socket.leave(roomId)
       }
     }
-  });
+
+    // Add to waiting queue or match with waiting user
+    if (waitingUser === null) {
+      waitingUser = socket
+      socket.emit("waiting", "Looking for a partner...")
+    } else if (waitingUser.id !== socket.id) {
+      // Create a new room
+      const roomId = `${socket.id}#${waitingUser.id}`
+      rooms[roomId] = [waitingUser.id, socket.id]
+
+      // Add both users to the room
+      waitingUser.join(roomId)
+      socket.join(roomId)
+
+      // Notify both users about the room
+      io.to(roomId).emit("room-joined", roomId)
+
+      // Reset waiting user
+      waitingUser = null
+    }
+  })
+
+  // Handle leaving a room
+  socket.on("leave-room", (roomId) => {
+    if (rooms[roomId]) {
+      // Notify the other user
+      socket.to(roomId).emit("user-disconnected")
+
+      // Clean up the room
+      delete rooms[roomId]
+
+      // Leave the room
+      socket.leave(roomId)
+    }
+  })
 
   // Handle disconnection
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+    console.log(`User disconnected: ${socket.id}`)
 
-    // Remove user from waiting rooms
-    Object.keys(waitingUsers).forEach((country) => {
-      waitingUsers[country] = waitingUsers[country].filter((user) => user.socketId !== socket.id);
-    });
+    // If the user was waiting, clear them
+    if (waitingUser && waitingUser.id === socket.id) {
+      waitingUser = null
+    }
 
-    // Notify peers in active rooms
-    activeRooms.forEach((room, roomId) => {
-      const userInRoom = room.users.find((user) => user.socketId === socket.id);
-
-      if (userInRoom) {
+    // Check rooms and remove the user
+    for (const roomId in rooms) {
+      if (rooms[roomId].includes(socket.id)) {
         // Notify the other user
-        room.users.forEach((user) => {
-          if (user.socketId !== socket.id) {
-            io.to(user.socketId).emit("peer_disconnected");
-          }
-        });
+        socket.to(roomId).emit("user-disconnected")
 
-        // Check if room is empty
-        const remainingUsers = io.sockets.adapter.rooms.get(roomId);
-        if (!remainingUsers || remainingUsers.size === 0) {
-          activeRooms.delete(roomId);
-          console.log(`Room ${roomId} deleted after disconnect`);
-        }
+        // Clean up the room
+        delete rooms[roomId]
       }
-    });
-  });
-});
+    }
+  })
+})
 
-// Clean up stale waiting users periodically
-setInterval(() => {
-  const now = Date.now();
-  const timeout = 5 * 60 * 1000; // 5 minutes
-
-  Object.keys(waitingUsers).forEach((country) => {
-    waitingUsers[country] = waitingUsers[country].filter((user) => {
-      const isStale = now - user.joinedAt > timeout;
-      if (isStale) {
-        console.log(`Removing stale user ${user.userId} from ${country} waiting room`);
-      }
-      return !isStale;
-    });
-  });
-}, 60 * 1000); // Run every minute
-
-app.get("/", (req, res) => {
-  res.send("Random Video Chat Signaling Server");
-});
-
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Signaling server is running on port ${PORT}`);
-});
+// Start the server
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
+})
